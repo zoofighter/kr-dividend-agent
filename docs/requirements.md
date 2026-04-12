@@ -33,8 +33,8 @@ related:
 | DART 공시 검색 (RAG) | **포함** | 1차 신뢰 소스 |
 | LangGraph 검증 루프 | **포함** | **MVP의 핵심** |
 | 엑셀 출력 | **포함** | `.xlsx` 형식 |
+| 웹 검색 보조 수집 | **포함** | Naver API / DuckDuckGo — DART 보완 |
 | 자사주 소각 데이터 | **추후** | MVP 제외 |
-| 배당 관련 뉴스 수집 | **추후** | MVP 제외 |
 | 배당 추천 기능 | **추후** | MVP 제외 |
 
 ---
@@ -86,7 +86,8 @@ related:
 |------|------|----------|
 | **DART 공시** | 1차 신뢰 소스 — 날짜·금액 확정 | **RAG** (벡터 검색) |
 | **pykrx** | 과거 10년 배당 이력 빠른 수집 | 직접 API 호출 |
-| **뉴스 검색** | 추후 추가 | MVP 제외 |
+| **Naver 검색 API** | DART 미등재 최신 배당 뉴스·공지 보완 | REST API (JSON) |
+| **DuckDuckGo 검색** | Naver API 한도 초과 또는 비로그인 폴백 | `duckduckgo-search` 라이브러리 |
 
 ### 3-2. DART를 RAG로 사용하는 이유
 
@@ -120,7 +121,8 @@ graph TD
     B --> C[search_dart_rag]
     C --> D[extract_dividend_from_dart]
     D --> E[fetch_pykrx_history]
-    E --> F[validate_result]
+    E --> W[search_web]
+    W --> F[validate_result]
     F -->|valid| G[calculate_metrics]
     G --> H[save_result]
     H --> I[END]
@@ -167,6 +169,11 @@ class DividendAgentState(TypedDict, total=False):
     # 소스별 추출값 (검증 비교용)
     extracted_from_dart: dict
     extracted_from_pykrx: dict
+    extracted_from_web: dict       # 웹 검색 결과 (Naver / DuckDuckGo)
+
+    # 웹 검색
+    web_search_results: list       # 원본 검색 결과 스니펫
+    web_search_provider: str       # "naver" / "duckduckgo"
 
     # 검증 제어 상태
     validation_status: str    # valid / retry / manual_review
@@ -280,6 +287,45 @@ def fetch_pykrx_history(state: DividendAgentState) -> DividendAgentState:
     return {"pykrx_history": df.to_dict()}
 ```
 
+#### `search_web`
+
+DART에서 데이터를 찾지 못하거나 검증 보완이 필요할 때 웹 검색으로 배당 정보를 추가 수집한다.
+
+- **Naver 검색 API** 우선 시도 (뉴스 + 웹 문서)
+- Naver API 실패(한도 초과, 미설정) 시 **DuckDuckGo** 폴백
+- 검색 결과 스니펫에서 배당금·날짜 키워드를 정규식으로 1차 필터링 후 LLM 추출
+
+```python
+def search_web(state: DividendAgentState) -> DividendAgentState:
+    company = state["company_name"]
+    year = state["year"]
+    query = f"{company} {year} 배당금 배당기준일"
+
+    results = []
+    provider = "naver"
+
+    try:
+        # 1순위: Naver 검색 API
+        results = naver_search(query, display=5)
+    except NaverAPIError:
+        # 폴백: DuckDuckGo
+        provider = "duckduckgo"
+        results = ddgs.text(query, max_results=5)
+
+    # 스니펫에서 배당 관련 키워드 필터링
+    filtered = [r for r in results if _is_dividend_related(r["description"])]
+
+    return {
+        "web_search_results": filtered,
+        "web_search_provider": provider,
+    }
+```
+
+**웹 검색 활용 원칙:**
+- DART·pykrx가 모두 `null`인 필드의 보완 소스로만 사용
+- 웹 검색 단독으로 확정 판정 불가 → 항상 `신뢰도 페널티 -0.1` 부여
+- 출처 URL을 `evidence` 필드에 포함
+
 #### `validate_result`
 
 소스 간 값 비교 및 재시도 판정.
@@ -290,18 +336,29 @@ def fetch_pykrx_history(state: DividendAgentState) -> DividendAgentState:
 - 배당기준일 불일치
 - 날짜 규칙 위반: 배당락일 ≠ 배당기준일 - 1 영업일
 
+> **웹 검색 활용 규칙**: DART와 pykrx 모두 `null`인 필드는 `extracted_from_web` 값으로 보완.
+> 단, 웹 단독 값은 `confidence_score -= 0.1` 페널티 적용.
+
 ```python
 def validate_result(state: DividendAgentState) -> DividendAgentState:
     dart = state.get("extracted_from_dart", {})
     pykrx = state.get("extracted_from_pykrx", {})
+    web = state.get("extracted_from_web", {})
 
     issues = []
 
-    # 배당금 비교
-    if dart.get("dividend_amount") and pykrx.get("dividend_amount"):
-        diff = abs(dart["dividend_amount"] - pykrx["dividend_amount"])
+    # 배당금 비교 (웹 검색으로 보완)
+    dart_amt = dart.get("dividend_amount")
+    pykrx_amt = pykrx.get("dividend_amount")
+    web_amt = web.get("dividend_amount")
+
+    if dart_amt and pykrx_amt:
+        diff = abs(dart_amt - pykrx_amt)
         if diff > 10:
-            issues.append(f"배당금 불일치: DART={dart['dividend_amount']}, pykrx={pykrx['dividend_amount']}")
+            if web_amt:
+                issues.append(f"배당금 불일치: DART={dart_amt}, pykrx={pykrx_amt}, web={web_amt} (웹 참고)")
+            else:
+                issues.append(f"배당금 불일치: DART={dart_amt}, pykrx={pykrx_amt}")
 
     # 배당락일 규칙 검증
     if dart.get("record_date") and dart.get("ex_dividend_date"):
@@ -549,6 +606,8 @@ pykrx: {extracted_from_pykrx}
 | LLM | `langchain-openai` | 필드 추출·재검색 쿼리 생성 |
 | DART RAG | `dart-fss`, `langchain`, `FAISS` | 공시 검색 및 청크 추출 |
 | 과거 데이터 | `pykrx` | 과거 10년 배당 이력 |
+| 웹 검색 (1순위) | `requests` + Naver 검색 API | 최신 배당 뉴스·공지 보완 수집 |
+| 웹 검색 (폴백) | `duckduckgo-search` | Naver API 불가 시 대체 검색 |
 | 영업일 계산 | `pandas-market-calendars` | 배당락일 규칙 검증 |
 | 엑셀 출력 | `openpyxl` | 결과 파일 생성 |
 | 상태 저장 | `langgraph.checkpoint.sqlite` | 중간 실패 시 재개 |

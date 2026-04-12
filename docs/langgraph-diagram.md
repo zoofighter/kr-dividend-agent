@@ -27,6 +27,8 @@ flowchart TD
 
     D["📊 fetch_pykrx_history\npykrx API 호출\n과거 10년 배당 이력 수집\n배당락일 기준 주가 수집"]
 
+    W["🌐 search_web\nNaver 검색 API (1순위)\nDuckDuckGo (폴백)\nDART 미등재 최신 정보 보완"]
+
     E{"✅ validate_result\n소스 간 값 비교\n배당금 불일치 ±10원\n배당락일 규칙 검증\nretry_count 확인"}
 
     F["📈 calculate_metrics\n배당 수익률 계산\n신뢰도 점수 산정\n데이터 출처 정리"]
@@ -42,7 +44,8 @@ flowchart TD
     A --> B
     B --> C
     C --> D
-    D --> E
+    D --> W
+    W --> E
 
     E -->|"validation_status == valid"| F
     F --> G
