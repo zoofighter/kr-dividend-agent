@@ -1,0 +1,32 @@
+# LangGraph / LangChain
+langgraph>=0.2
+langchain>=0.3
+langchain-community>=0.3
+
+# Local LLM (Ollama)
+ollama
+
+# Embeddings (local)
+sentence-transformers
+faiss-cpu
+
+# DART 공시
+dart-fss
+
+# 주가·배당 이력
+pykrx
+
+# 영업일 계산 (배당락일 검증)
+pandas-market-calendars
+
+# 웹 검색 폴백
+duckduckgo-search
+
+# 데이터 처리
+pandas
+openpyxl
+beautifulsoup4
+requests
+
+# 환경변수
+python-dotenv
