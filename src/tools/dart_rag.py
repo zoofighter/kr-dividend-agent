@@ -1,21 +1,43 @@
 """
-DART RAG 도구
+DART 배당 데이터 수집 도구
 
-흐름:
-  1. dart-fss로 해당 종목·연도 공시 문서 검색 (사업보고서 / 반기보고서)
-  2. 문서 텍스트를 청크로 분할
-  3. HuggingFace SBERT 임베딩 → FAISS VectorStore
-  4. 쿼리로 관련 청크 top-k 반환
+2단계 전략:
+  1. 구조화 API (alotMatter.json)  — 배당금·배당수익률·배당성향 직접 수집
+  2. 공시 원문 파싱               — 배당기준일·배당지급일 등 날짜 수집
+  3. RAG 청크 구성                — LLM 추출용 텍스트 조합 (날짜 등 누락 필드 보완)
+
+DART Open API 엔드포인트:
+  alotMatter.json  : 배당에 관한 사항 (배당금, 수익률, 성향)
+  document.xml     : 공시 원문 ZIP (HTML)
+  list.json        : 공시 목록 조회
 """
 from __future__ import annotations
 
+import io
 import logging
 import os
+import re
+import zipfile
 from typing import Optional
 
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+load_dotenv()
 logger = logging.getLogger(__name__)
 
-# ── dart-fss 초기화 (모듈 최초 import 시 1회) ────────────────────
+DART_BASE = "https://opendart.fss.or.kr/api"
+
+# 사업보고서 연도별 공시 코드
+REPRT_CODES = {
+    "annual":  "11011",   # 사업보고서
+    "half":    "11012",   # 반기보고서
+    "q1":      "11013",   # 1분기보고서
+    "q3":      "11014",   # 3분기보고서
+}
+
+# ── dart-fss 법인 목록 캐시 ─────────────────────────────────────
 _corp_list = None
 
 
@@ -26,170 +48,258 @@ def _get_corp_list():
         from src.config import DART_API_KEY
         dart.set_api_key(DART_API_KEY)
         _corp_list = dart.get_corp_list()
-        logger.info("DART 법인 목록 로드 완료")
     return _corp_list
 
 
-# ── 임베딩 / VectorStore (모델은 최초 1회 로드) ─────────────────
-_embeddings = None
+def _get_corp_code(company_name: str) -> Optional[str]:
+    """종목명 → DART corp_code 변환."""
+    try:
+        corp_list = _get_corp_list()
+        corps = corp_list.find_by_corp_name(company_name, exactly=True)
+        if corps:
+            return corps[0].corp_code
+    except Exception as exc:
+        logger.warning("corp_code 조회 실패 %s: %s", company_name, exc)
+    return None
 
 
-def _get_embeddings():
-    global _embeddings
-    if _embeddings is None:
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-        from src.config import EMBED_MODEL
-        _embeddings = HuggingFaceEmbeddings(
-            model_name=EMBED_MODEL,
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True},
+def _dart_get(endpoint: str, params: dict) -> dict:
+    """DART API GET 호출."""
+    from src.config import DART_API_KEY
+    params["crtfc_key"] = DART_API_KEY
+    resp = requests.get(f"{DART_BASE}/{endpoint}", params=params, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+# ── 1. 구조화 API — 배당금·수익률·성향 ─────────────────────────
+
+def fetch_alot_matter(corp_code: str, year: int) -> Optional[dict]:
+    """
+    alotMatter.json 으로 배당에 관한 사항을 수집한다.
+
+    Returns
+    -------
+    dict 또는 None
+    {
+      "dividend_amount": float,       # 주당 현금배당금 (보통주, 원)
+      "dividend_yield": float,        # 현금배당수익률 (보통주, %)
+      "payout_ratio": float,          # 현금배당성향 (%)
+      "record_date": str,             # 결산일 (YYYY-MM-DD)
+      "rcept_no": str,
+    }
+    """
+    for reprt_code in [REPRT_CODES["annual"], REPRT_CODES["half"]]:
+        try:
+            data = _dart_get("alotMatter.json", {
+                "corp_code": corp_code,
+                "bsns_year": str(year),
+                "reprt_code": reprt_code,
+            })
+            if data.get("status") != "000":
+                continue
+
+            items = data.get("list", [])
+            result = _parse_alot_items(items)
+            if result:
+                return result
+        except Exception as exc:
+            logger.debug("alotMatter 조회 실패 year=%d code=%s: %s", year, reprt_code, exc)
+
+    return None
+
+
+def _parse_alot_items(items: list) -> Optional[dict]:
+    """alotMatter API 응답에서 보통주 배당 정보를 추출한다."""
+    result = {}
+    for item in items:
+        se = item.get("se", "")
+        thstrm = item.get("thstrm", "-").replace(",", "").strip()
+        stock_knd = item.get("stock_knd", "")
+
+        # 주당 현금배당금 (보통주)
+        if "주당 현금배당금" in se and stock_knd == "보통주":
+            try:
+                result["dividend_amount"] = float(thstrm)
+            except ValueError:
+                pass
+
+        # 현금배당수익률 (보통주)
+        elif "현금배당수익률" in se and stock_knd == "보통주":
+            try:
+                result["dividend_yield"] = float(thstrm)
+            except ValueError:
+                pass
+
+        # 현금배당성향
+        elif "현금배당성향" in se:
+            try:
+                result["payout_ratio"] = float(thstrm)
+            except ValueError:
+                pass
+
+        # 결산일
+        stlm_dt = item.get("stlm_dt", "")
+        if stlm_dt and "record_date" not in result:
+            result["record_date"] = stlm_dt
+
+        # rcept_no
+        if item.get("rcept_no") and "rcept_no" not in result:
+            result["rcept_no"] = item["rcept_no"]
+
+    return result if result.get("dividend_amount") else None
+
+
+# ── 2. 공시 원문 파싱 — 배당락일·지급일 ────────────────────────
+
+def fetch_dividend_dates(corp_code: str, year: int) -> dict:
+    """
+    '현금·현물배당결정' 공시 원문에서 배당락일·지급일을 파싱한다.
+
+    Returns
+    -------
+    dict {"ex_dividend_date": str|None, "payment_date": str|None,
+          "record_date": str|None, "rcept_no": str|None}
+    """
+    from src.config import DART_API_KEY
+
+    # 배당결정 공시는 보통 다음 해 상반기에 올라옴
+    try:
+        data = _dart_get("list.json", {
+            "corp_code": corp_code,
+            "bgn_de": f"{year}0101",
+            "end_de": f"{year + 1}0630",
+            "page_count": "40",
+        })
+        filings = data.get("list", [])
+    except Exception as exc:
+        logger.warning("공시 목록 조회 실패: %s", exc)
+        return {}
+
+    # 배당 관련 공시 rcept_no 수집
+    target_nos = [
+        f["rcept_no"] for f in filings
+        if any(k in f.get("report_nm", "") for k in ["배당결정", "현금ㆍ현물배당"])
+    ]
+
+    for rcept_no in target_nos[:3]:
+        dates = _parse_dividend_doc(rcept_no, DART_API_KEY)
+        if dates.get("payment_date") or dates.get("record_date"):
+            dates["rcept_no"] = rcept_no
+            return dates
+
+    return {}
+
+
+def _parse_dividend_doc(rcept_no: str, api_key: str) -> dict:
+    """공시 ZIP 원문 HTML에서 날짜 정보를 파싱한다."""
+    try:
+        resp = requests.get(
+            f"{DART_BASE}/document.xml",
+            params={"crtfc_key": api_key, "rcept_no": rcept_no},
+            timeout=20,
         )
-        logger.info("임베딩 모델 로드 완료: %s", EMBED_MODEL)
-    return _embeddings
+        if not resp.content[:2] == b'PK':
+            return {}
 
+        z = zipfile.ZipFile(io.BytesIO(resp.content))
+        html_bytes = z.read(z.namelist()[0])
+
+        # EUC-KR 디코딩
+        for enc in ("euc-kr", "cp949", "utf-8"):
+            try:
+                html = html_bytes.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            return {}
+
+        return _extract_dates_from_html(html)
+
+    except Exception as exc:
+        logger.debug("공시 파싱 오류 %s: %s", rcept_no, exc)
+        return {}
+
+
+def _extract_dates_from_html(html: str) -> dict:
+    """HTML 테이블에서 배당 날짜를 정규식으로 추출한다."""
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(separator="\n")
+
+    result = {}
+    date_pat = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    for i, line in enumerate(lines):
+        following = lines[i + 1] if i + 1 < len(lines) else ""
+        date_match = date_pat.search(following) or date_pat.search(line)
+
+        if "기준일" in line and "record_date" not in result:
+            m = date_pat.search(following) or date_pat.search(line)
+            if m:
+                result["record_date"] = m.group()
+
+        elif "지급" in line and "일" in line and "payment_date" not in result:
+            m = date_pat.search(following) or date_pat.search(line)
+            if m:
+                result["payment_date"] = m.group()
+
+        elif "락" in line and "ex_dividend_date" not in result:
+            m = date_pat.search(following) or date_pat.search(line)
+            if m:
+                result["ex_dividend_date"] = m.group()
+
+    return result
+
+
+# ── 3. 통합 수집 함수 (노드에서 호출) ──────────────────────────
 
 def search_dart_disclosure(
     company_name: str,
     year: int,
-    query: str,
-    top_k: int = 5,
+    query: str = "",          # 하위 호환용 (현재 미사용)
+    top_k: int = 5,           # 하위 호환용 (현재 미사용)
 ) -> list[dict]:
     """
-    DART 공시에서 배당 관련 청크를 RAG로 검색한다.
-
-    Parameters
-    ----------
-    company_name : 종목명 (예: "삼성전자")
-    year         : 대상 연도 (예: 2024)
-    query        : 검색 쿼리 (예: "삼성전자 2024 배당")
-    top_k        : 반환할 청크 수
+    DART에서 배당 데이터를 수집하고 청크 리스트로 반환한다.
+    (LangGraph 노드와 인터페이스 유지)
 
     Returns
     -------
-    list[dict]  [{"content": str, "source": str, "score": float}, ...]
-    빈 리스트 반환 시 공시 없음 또는 오류
+    list[dict]  [{"content": str, "source": str, "score": float}]
     """
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-    from langchain_community.vectorstores import FAISS
-    from langchain_core.documents import Document
-    from src.config import CHUNK_SIZE, CHUNK_OVERLAP
-
-    # 1. 공시 문서 수집
-    raw_docs = _fetch_dart_docs(company_name, year)
-    if not raw_docs:
-        logger.warning("DART 공시 없음: %s %d년", company_name, year)
+    corp_code = _get_corp_code(company_name)
+    if not corp_code:
+        logger.warning("corp_code 없음: %s", company_name)
         return []
 
-    # 2. 텍스트 청크 분할
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", "。", ".", " ", ""],
-    )
-    documents: list[Document] = []
-    for doc in raw_docs:
-        chunks = splitter.split_text(doc["text"])
-        for chunk in chunks:
-            documents.append(
-                Document(
-                    page_content=chunk,
-                    metadata={"source": doc["source"], "year": year},
-                )
-            )
+    # 1. 구조화 배당금 데이터
+    alot = fetch_alot_matter(corp_code, year)
 
-    if not documents:
+    # 2. 날짜 데이터
+    dates = fetch_dividend_dates(corp_code, year)
+
+    if not alot and not dates:
         return []
 
-    # 3. FAISS VectorStore 생성 및 유사도 검색
-    try:
-        embeddings = _get_embeddings()
-        vs = FAISS.from_documents(documents, embeddings)
-        results = vs.similarity_search_with_score(query, k=min(top_k, len(documents)))
-    except Exception as exc:
-        logger.error("FAISS 검색 오류: %s", exc)
-        return []
+    # 3. 텍스트 청크 조합 (LLM 추출용)
+    lines = [f"[DART 배당 데이터] {company_name} {year}년"]
+    if alot:
+        lines += [
+            f"주당 현금배당금(보통주): {alot.get('dividend_amount')}원",
+            f"현금배당수익률(보통주): {alot.get('dividend_yield')}%",
+            f"현금배당성향: {alot.get('payout_ratio')}%",
+            f"결산일: {alot.get('record_date')}",
+        ]
+    if dates:
+        lines += [
+            f"배당기준일: {dates.get('record_date')}",
+            f"배당락일: {dates.get('ex_dividend_date')}",
+            f"배당지급일: {dates.get('payment_date')}",
+        ]
 
-    return [
-        {
-            "content": doc.page_content,
-            "source": doc.metadata.get("source", ""),
-            "score": float(score),
-        }
-        for doc, score in results
-    ]
+    content = "\n".join(filter(lambda x: "None" not in x, lines))
+    source = alot.get("rcept_no") or dates.get("rcept_no") or "DART"
 
-
-def _fetch_dart_docs(company_name: str, year: int) -> list[dict]:
-    """dart-fss로 공시 원문 텍스트를 수집한다."""
-    try:
-        corp_list = _get_corp_list()
-        corps = corp_list.find_by_corp_name(company_name, exactly=True)
-        if not corps:
-            logger.warning("DART 법인 검색 실패: %s", company_name)
-            return []
-
-        corp = corps[0]
-        bgn_de = f"{year}0101"
-        end_de = f"{year}1231"
-
-        # 사업보고서(A001) 우선, 없으면 반기보고서(A002)
-        docs = []
-        for pblntf_ty in ["A001", "A002"]:
-            try:
-                filings = corp.search_filings(
-                    bgn_de=bgn_de,
-                    end_de=end_de,
-                    pblntf_ty=pblntf_ty,
-                    page_count=3,
-                )
-                if filings and len(filings) > 0:
-                    docs.extend(_extract_text_from_filings(filings, company_name, year))
-                    if docs:
-                        break   # 사업보고서에서 충분히 수집되면 반기보고서 생략
-            except Exception as exc:
-                logger.debug("공시 검색 오류 type=%s: %s", pblntf_ty, exc)
-
-        return docs
-
-    except Exception as exc:
-        logger.error("DART 문서 수집 오류 %s %d: %s", company_name, year, exc)
-        return []
-
-
-def _extract_text_from_filings(filings, company_name: str, year: int) -> list[dict]:
-    """공시 객체에서 텍스트를 추출한다."""
-    docs = []
-    for filing in filings[:2]:   # 최대 2건
-        try:
-            # dart-fss Report 객체의 텍스트 접근
-            report = filing.to_dict() if hasattr(filing, "to_dict") else {}
-
-            # 공시 제목과 기본 정보로 텍스트 구성
-            title = getattr(filing, "report_nm", "") or report.get("report_nm", "")
-            rcept_dt = getattr(filing, "rcept_dt", "") or report.get("rcept_dt", "")
-
-            # 상세 문서 내용 시도
-            text_parts = [f"[공시] {title} ({rcept_dt})"]
-
-            try:
-                # dart-fss의 문서 내용 접근
-                if hasattr(filing, "pages"):
-                    for page in filing.pages[:10]:
-                        if hasattr(page, "to_dict"):
-                            page_dict = page.to_dict()
-                            if "text" in page_dict:
-                                text_parts.append(page_dict["text"][:2000])
-            except Exception:
-                pass
-
-            text = "\n".join(filter(None, text_parts))
-            if text.strip():
-                source_url = getattr(filing, "rcept_no", "")
-                docs.append({
-                    "text": text,
-                    "source": f"DART:{source_url}",
-                })
-        except Exception as exc:
-            logger.debug("공시 텍스트 추출 오류: %s", exc)
-
-    return docs
+    return [{"content": content, "source": f"DART:{source}", "score": 1.0}]
