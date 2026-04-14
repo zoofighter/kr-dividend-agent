@@ -19,9 +19,6 @@ class DividendAgentState(TypedDict, total=False):
     dart_chunks: list         # DART RAG 검색 결과 청크
     dart_query: str           # 사용한 검색 쿼리
 
-    # ── pykrx 과거 데이터 ──────────────────────────
-    pykrx_history: dict       # {year: {dividend, div_yield, ...}}
-
     # ── 추출된 구조화 값 ───────────────────────────
     dividend_amount: float    # 주당 배당금 (원)
     ex_dividend_date: str     # 배당락일 (YYYY-MM-DD)
@@ -34,8 +31,8 @@ class DividendAgentState(TypedDict, total=False):
     dividend_yield: float     # 배당 수익률 (%)
 
     # ── 소스별 추출값 (교차 검증용) ────────────────
+    # 소스: DART(1차) / 웹검색(2차)
     extracted_from_dart: dict
-    extracted_from_pykrx: dict
     extracted_from_web: dict
 
     # ── 웹 검색 ────────────────────────────────────

@@ -100,7 +100,7 @@ WEB_EXTRACT_PROMPT = """\
 # 프롬프트 3 — 불일치 원인 → DART 재검색 쿼리 생성
 # 사용 노드: build_retry_query
 # 입력 변수: {company}, {year}, {validation_reason},
-#           {extracted_from_dart}, {extracted_from_pykrx}
+#           {extracted_from_dart}, {extracted_from_web}
 # ────────────────────────────────────────────────────────────────
 RETRY_QUERY_PROMPT = """\
 [상황]
@@ -109,7 +109,7 @@ RETRY_QUERY_PROMPT = """\
 
 [현재 수집된 값]
 DART 공시: {extracted_from_dart}
-pykrx 이력: {extracted_from_pykrx}
+웹 검색: {extracted_from_web}
 
 [지시]
 위 불일치를 해소할 수 있는 DART 공시 검색 쿼리를 1개 생성하라.
@@ -130,7 +130,7 @@ pykrx 이력: {extracted_from_pykrx}
 # ────────────────────────────────────────────────────────────────
 # 프롬프트 4 — 충돌 내용 → 수동 검토용 판단 근거 생성
 # 사용 노드: validate_result (manual_review 판정 시)
-# 입력 변수: {company}, {year}, {issues}, {dart}, {pykrx}, {web}
+# 입력 변수: {company}, {year}, {issues}, {dart}, {web}
 # ────────────────────────────────────────────────────────────────
 VALIDATION_JUDGE_PROMPT = """\
 [역할]
@@ -145,7 +145,6 @@ VALIDATION_JUDGE_PROMPT = """\
 
 [소스별 수집값]
 - DART 공시: {dart}
-- pykrx 이력: {pykrx}
 - 웹 검색: {web}
 
 [작성 지시]

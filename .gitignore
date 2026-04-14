@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 환경변수 (실제 키 노출 방지)
+.env
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# LangGraph 체크포인트 (로컬 실행 데이터)
+checkpoint.db
+*.db
+
+# 출력 파일
+output/
+
+# 에디터
+.DS_Store
+.idea/
+.vscode/
+*.swp

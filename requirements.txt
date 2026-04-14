@@ -13,9 +13,6 @@ faiss-cpu
 # DART 공시
 dart-fss
 
-# 주가·배당 이력
-pykrx
-
 # 영업일 계산 (배당락일 검증)
 pandas-market-calendars
 
