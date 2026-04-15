@@ -154,7 +154,10 @@ def _parse_alot_items(items: list) -> Optional[dict]:
 
 def fetch_dividend_dates(corp_code: str, year: int) -> dict:
     """
-    '현금·현물배당결정' 공시 원문에서 배당락일·지급일을 파싱한다.
+    '현금·현물배당결정' 공시 원문에서 배당기준일·지급일을 파싱한다.
+
+    삼성전자처럼 분기 배당 종목은 연 4회 공시 → 페이지네이션 필요.
+    연말(12월) 기준일이 포함된 공시 우선 반환.
 
     Returns
     -------
@@ -163,32 +166,49 @@ def fetch_dividend_dates(corp_code: str, year: int) -> dict:
     """
     from src.config import DART_API_KEY
 
-    # 배당결정 공시는 보통 다음 해 상반기에 올라옴
+    # 배당결정 공시 전체 수집 (여러 페이지 순회)
+    target_nos = []
     try:
-        data = _dart_get("list.json", {
-            "corp_code": corp_code,
-            "bgn_de": f"{year}0101",
-            "end_de": f"{year + 1}0630",
-            "page_count": "40",
-        })
-        filings = data.get("list", [])
+        for page in range(1, 15):   # 최대 14페이지 × 40건 = 560건
+            data = _dart_get("list.json", {
+                "corp_code": corp_code,
+                "bgn_de": f"{year}0101",
+                "end_de": f"{year + 1}0630",
+                "page_count": "40",
+                "page_no": str(page),
+            })
+            items = data.get("list", [])
+            for f in items:
+                nm = f.get("report_nm", "")
+                if any(k in nm for k in ["배당결정", "현금ㆍ현물배당"]):
+                    target_nos.append((f["rcept_dt"], f["rcept_no"]))
+            if len(items) < 40:
+                break   # 마지막 페이지
     except Exception as exc:
         logger.warning("공시 목록 조회 실패: %s", exc)
         return {}
 
-    # 배당 관련 공시 rcept_no 수집
-    target_nos = [
-        f["rcept_no"] for f in filings
-        if any(k in f.get("report_nm", "") for k in ["배당결정", "현금ㆍ현물배당"])
-    ]
+    if not target_nos:
+        return {}
 
-    for rcept_no in target_nos[:3]:
+    # 날짜순 정렬 후 파싱 — 12월 결산 기준일이 있는 공시 우선
+    target_nos.sort(key=lambda x: x[0])   # rcept_dt 오름차순
+    best: dict = {}
+
+    for rcept_dt, rcept_no in target_nos:
         dates = _parse_dividend_doc(rcept_no, DART_API_KEY)
-        if dates.get("payment_date") or dates.get("record_date"):
-            dates["rcept_no"] = rcept_no
+        if not dates.get("payment_date") and not dates.get("record_date"):
+            continue
+        dates["rcept_no"] = rcept_no
+        # 결산 배당(12월 기준일)이면 즉시 반환
+        rec = dates.get("record_date", "")
+        if rec and rec.endswith("-12-31"):
             return dates
+        # 아니면 후보로 보관 (더 좋은 것 탐색)
+        if not best:
+            best = dates
 
-    return {}
+    return best
 
 
 def _parse_dividend_doc(rcept_no: str, api_key: str) -> dict:

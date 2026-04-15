@@ -50,8 +50,11 @@ def search_dart_rag(state: DividendAgentState) -> dict:
 
 def extract_dividend_from_dart(state: DividendAgentState) -> dict:
     """
-    DART RAG 청크에서 LLM으로 배당 필드를 구조화 추출한다.
-    청크가 없으면 빈 dict를 반환한다.
+    DART RAG 청크에서 배당 필드를 추출한다.
+
+    전략:
+      1. 청크 텍스트에서 직접 파싱 (DART 구조화 API 결과는 파싱 가능)
+      2. 파싱 실패 시 Ollama LLM 추출 폴백
     """
     chunks = state.get("dart_chunks") or []
 
@@ -59,21 +62,64 @@ def extract_dividend_from_dart(state: DividendAgentState) -> dict:
         logger.warning("extract_dividend_from_dart: dart_chunks 없음 — 추출 스킵")
         return {"extracted_from_dart": {}}
 
-    # 청크를 하나의 텍스트로 합치기
     chunks_text = "\n\n---\n\n".join(c["content"] for c in chunks)
 
+    # 1. 직접 파싱 시도 (DART 구조화 API 텍스트)
+    result = _parse_dart_structured(chunks_text)
+    if result.get("dividend_amount"):
+        logger.info("DART 직접 파싱 성공: %s", result)
+        return {"extracted_from_dart": result}
+
+    # 2. LLM 폴백
     try:
         result = _run_llm_extraction(
             chunks_text=chunks_text,
             company_name=state["company_name"],
             year=state["year"],
         )
-        logger.info("DART 추출 결과: %s", result)
+        logger.info("DART LLM 추출 결과: %s", result)
     except Exception as exc:
-        logger.error("DART LLM 추출 오류: %s", exc)
+        logger.error("DART LLM 추출 오류 (Ollama 미실행?): %s", exc)
         result = {}
 
     return {"extracted_from_dart": result}
+
+
+def _parse_dart_structured(text: str) -> dict:
+    """
+    search_dart_disclosure()가 반환한 포맷 텍스트를 직접 파싱한다.
+
+    포맷 예:
+      주당 현금배당금(보통주): 1444.0원
+      현금배당수익률(보통주): 1.9%
+      결산일: 2023-12-31
+      배당기준일: 2023-12-31
+      배당지급일: 2024-05-17
+    """
+    import re
+    result = {}
+
+    patterns = {
+        "dividend_amount":  r"주당 현금배당금\(보통주\):\s*([\d.]+)원",
+        "dividend_yield":   r"현금배당수익률\(보통주\):\s*([\d.]+)%",
+        "payout_ratio":     r"현금배당성향:\s*([\d.]+)%",
+        "record_date":      r"(?:배당기준일|결산일):\s*(\d{4}-\d{2}-\d{2})",
+        "payment_date":     r"배당지급일:\s*(\d{4}-\d{2}-\d{2})",
+        "ex_dividend_date": r"배당락일:\s*(\d{4}-\d{2}-\d{2})",
+    }
+    for field, pat in patterns.items():
+        m = re.search(pat, text)
+        if m:
+            val = m.group(1)
+            try:
+                result[field] = float(val) if field in ("dividend_amount", "dividend_yield", "payout_ratio") else val
+            except ValueError:
+                result[field] = val
+
+    if result.get("dividend_amount"):
+        result["dividend_status"] = "확정"
+
+    return result
 
 
 def _run_llm_extraction(chunks_text: str, company_name: str, year: int) -> dict:
